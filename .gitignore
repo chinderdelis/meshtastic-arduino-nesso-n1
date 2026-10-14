@@ -1,0 +1,12 @@
+# Firmware build artifacts (attached to releases, not committed to git)
+*.bin
+*.elf
+*.map
+*.mt.json
+dist/
+
+# Local / editor
+.vscode/
+.idea/
+.DS_Store
+*.swp

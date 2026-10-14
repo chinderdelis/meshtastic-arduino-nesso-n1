@@ -1,0 +1,1609 @@
+diff --git a/src/configuration.h b/src/configuration.h
+index 6d5587d8..e6475669 100644
+--- a/src/configuration.h
++++ b/src/configuration.h
+@@ -286,6 +286,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ #define MMC5983MA_ADDR 0x30
+ #define QMC6309_ADDR 0x7C
+ #define SHTC3_ADDR 0x70
++#define QMP6988_ADDR 0x70
++#define QMP6988_ADDR_ALT 0x56
+ #define LPS22HB_ADDR 0x5C
+ #define LPS22HB_ADDR_ALT 0x5D
+ #define SFA30_ADDR 0x5D
+diff --git a/src/detect/ScanI2C.h b/src/detect/ScanI2C.h
+index be42b165..7cc3f8a4 100644
+--- a/src/detect/ScanI2C.h
++++ b/src/detect/ScanI2C.h
+@@ -115,6 +115,7 @@ class ScanI2C
+         LP5814,
+         ES8311,
+         ES7243E,
++        QMP6988,
+     } DeviceType;
+ 
+     // typedef uint8_t DeviceAddress;
+diff --git a/src/detect/ScanI2CTwoWire.cpp b/src/detect/ScanI2CTwoWire.cpp
+index 22772609..1bb87645 100644
+--- a/src/detect/ScanI2CTwoWire.cpp
++++ b/src/detect/ScanI2CTwoWire.cpp
+@@ -200,6 +200,8 @@ bool probeHM330x(TwoWire *i2cBus, uint8_t address)
+ #endif
+ 
+ #if HAS_TELEMETRY && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
++constexpr uint8_t QMP6988_DETECT_CHIP_ID = 0x5C;
++constexpr uint8_t QMP6988_DETECT_CHIP_ID_REG = 0xD1;
+ static uint8_t crcSHT2X(const uint8_t *data, uint8_t len)
+ {
+     uint8_t crc = 0;
+@@ -253,6 +255,19 @@ bool detectSHT21SerialNumber(TwoWire *i2cBus, uint8_t address)
+            crcSHT2X(&serialA[4], 1) == serialA[5] && crcSHT2X(&serialA[6], 1) == serialA[7] &&
+            crcSHT2X(&serialB[0], 2) == serialB[2] && crcSHT2X(&serialB[3], 2) == serialB[5];
+ }
++
++bool detectQMP6988ChipId(TwoWire *i2cBus, uint8_t address)
++{
++    i2cBus->beginTransmission(address);
++    i2cBus->write(QMP6988_DETECT_CHIP_ID_REG);
++    if (i2cBus->endTransmission() != 0)
++        return false;
++
++    if (i2cBus->requestFrom((int)address, 1) != 1)
++        return false;
++
++    return i2cBus->available() && i2cBus->read() == QMP6988_DETECT_CHIP_ID;
++}
+ #endif
+ 
+ // Everest Semiconductor ES7210 4-channel audio ADC, as found on the T-Deck. Its AD1/AD0 straps
+@@ -542,11 +557,15 @@ void ScanI2CTwoWire::scanPort(I2CPort port, uint8_t *address, uint8_t asize)
+                 break;
+ #ifndef HAS_NCP5623
+             case AHT10_ADDR:
++#if defined(ARDUINO_NESSO_N1) && defined(TOUCH_SLAVE_ADDRESS) && TOUCH_SLAVE_ADDRESS == AHT10_ADDR
++                LOG_DEBUG("Ignore address 0x%x as AHT10 because it is the Nesso touchscreen", (uint8_t)addr.address);
++#else
+                 logFoundDevice("AHT10", (uint8_t)addr.address);
+                 type = AHT10;
++#endif
+                 break;
+ #endif
+-#if !defined(M5STACK_UNITC6L)
++#if !defined(M5STACK_UNITC6L) && !defined(ARDUINO_NESSO_N1)
+             case INA_ADDR: // same as HM330X, ES7210 and SHT2X
+             case INA_ADDR_ALTERNATE:
+             case INA_ADDR_WAVESHARE_UPS: {
+@@ -691,8 +710,21 @@ void ScanI2CTwoWire::scanPort(I2CPort port, uint8_t *address, uint8_t asize)
+                 }
+ 
+                 break;
+-
+-                SCAN_SIMPLE_CASE(SHTC3_ADDR, SHTXX, "SHTXX", (uint8_t)addr.address)
++            case QMP6988_ADDR_ALT:
++                if (detectQMP6988ChipId(i2cBus, (uint8_t)addr.address)) {
++                    type = QMP6988;
++                    logFoundDevice("QMP6988", (uint8_t)addr.address);
++                }
++                break;
++            case SHTC3_ADDR:
++                if (detectQMP6988ChipId(i2cBus, (uint8_t)addr.address)) {
++                    type = QMP6988;
++                    logFoundDevice("QMP6988", (uint8_t)addr.address);
++                } else {
++                    type = SHTXX;
++                    logFoundDevice("SHTXX", (uint8_t)addr.address);
++                }
++                break;
+             case RCWL9620_ADDR:
+                 // get MAX30102 PARTID
+                 registerValue = getRegisterValue(ScanI2CTwoWire::RegisterLocation(addr, 0xFF), 1);
+diff --git a/src/graphics/TFTDisplay.cpp b/src/graphics/TFTDisplay.cpp
+index 485acd20..ab444016 100644
+--- a/src/graphics/TFTDisplay.cpp
++++ b/src/graphics/TFTDisplay.cpp
+@@ -17,6 +17,10 @@
+ extern SX1509 gpioExtender;
+ #endif
+ 
++#ifdef TFT_BL_EXT
++#include "GpioExtLogic.h"
++#endif
++
+ #ifdef TFT_MESH_OVERRIDE
+ uint16_t TFT_MESH = TFT_MESH_OVERRIDE;
+ #else
+@@ -518,6 +522,10 @@ class LGFX : public lgfx::LGFX_Device
+             cfg.pin_int = SCREEN_TOUCH_INT;
+ #ifdef SCREEN_TOUCH_RST
+             cfg.pin_rst = SCREEN_TOUCH_RST;
++#endif
++#ifdef ARDUINO_NESSO_N1
++            // Nesso shares GPIO3 with the system IRQ line, so poll the touch controller instead.
++            cfg.pin_int = -1;
+ #endif
+             cfg.bus_shared = true;
+             cfg.offset_rotation = TFT_OFFSET_ROTATION;
+@@ -527,11 +535,22 @@ class LGFX : public lgfx::LGFX_Device
+             cfg.i2c_port = TOUCH_I2C_PORT;
+             cfg.i2c_addr = TOUCH_SLAVE_ADDRESS;
+ #ifdef SCREEN_TOUCH_USE_I2C1
++#ifdef ARDUINO_NESSO_N1
++            cfg.pin_sda = -1;
++            cfg.pin_scl = -1;
++#else
+             cfg.pin_sda = I2C_SDA1;
+             cfg.pin_scl = I2C_SCL1;
++#endif
++#else
++#ifdef ARDUINO_NESSO_N1
++            cfg.pin_sda = -1;
++            cfg.pin_scl = -1;
++            cfg.freq = 100000;
+ #else
+             cfg.pin_sda = I2C_SDA;
+             cfg.pin_scl = I2C_SCL;
++#endif
+ #endif
+             // cfg.freq = 400000;
+ 
+@@ -548,9 +567,12 @@ static LGFX *tft = nullptr;
+ 
+ #elif defined(ST7789_CS)
+ #include <LovyanGFX.hpp> // Graphics and font library for ST7735 driver chip
++#if defined(HELTEC_V4_TFT) || defined(HELTEC_V4_R8_TFT) || defined(ARDUINO_NESSO_N1)
++#include <Wire.h>
++#include "lgfx/v1/Touch.hpp"
++#endif
+ #if defined(HELTEC_V4_TFT) || defined(HELTEC_V4_R8_TFT)
+ #include "chsc6x.h"
+-#include "lgfx/v1/Touch.hpp"
+ namespace lgfx
+ {
+ inline namespace v1
+@@ -603,13 +625,120 @@ class TOUCH_CHSC6X : public ITouch
+ } // namespace v1
+ } // namespace lgfx
+ #endif
++#ifdef ARDUINO_NESSO_N1
++namespace lgfx
++{
++inline namespace v1
++{
++class TOUCH_NESSO_FT5X06 : public ITouch
++{
++  public:
++    TOUCH_NESSO_FT5X06(void)
++    {
++        _cfg.i2c_addr = TOUCH_SLAVE_ADDRESS;
++        _cfg.x_min = 0;
++        _cfg.x_max = TFT_HEIGHT - 1;
++        _cfg.y_min = 0;
++        _cfg.y_max = TFT_WIDTH - 1;
++    };
++
++    bool init(void) override
++    {
++#ifdef SCREEN_TOUCH_RST
++        if (_cfg.pin_rst >= 0) {
++            ::pinMode(_cfg.pin_rst, OUTPUT);
++            ::digitalWrite(_cfg.pin_rst, LOW);
++            ::delay(1);
++            ::digitalWrite(_cfg.pin_rst, HIGH);
++        }
++#endif
++        if (_cfg.pin_int >= 0) {
++            ::pinMode(_cfg.pin_int, INPUT_PULLUP);
++        }
++        uint8_t info[6] = {0};
++        _inited = writeRegister8(0x00, 0x00) && readRegister(0xA3, info, sizeof(info)) && writeRegister8(0xA4, 0x00) && info[5];
++        return _inited;
++    };
++
++    uint_fast8_t getTouchRaw(touch_point_t *tp, uint_fast8_t count) override
++    {
++        if (!_inited || count == 0) {
++            return 0;
++        }
++        constexpr uint8_t maxTouchPoints = 5;
++        if (count > maxTouchPoints) {
++            count = maxTouchPoints;
++        }
++
++        uint8_t readbuf[29];
++        if (!readRegister(0x02, readbuf, sizeof(readbuf))) {
++            return 0;
++        }
++
++        uint_fast8_t points = std::min<uint_fast8_t>(count, readbuf[0] & 0x0F);
++        for (uint_fast8_t idx = 0; idx < points; ++idx) {
++            auto data = &readbuf[idx * 6];
++            tp[idx].size = 1;
++            tp[idx].x = (data[1] & 0x0F) << 8 | data[2];
++            tp[idx].y = (data[3] & 0x0F) << 8 | data[4];
++            tp[idx].id = data[3] >> 4;
++        }
++        return points;
++    };
++
++    void wakeup(void) override
++    {
++        if (_cfg.pin_int >= 0) {
++            ::pinMode(_cfg.pin_int, INPUT_PULLDOWN);
++            ::delayMicroseconds(512);
++            ::pinMode(_cfg.pin_int, INPUT_PULLUP);
++        }
++        writeRegister8(0xA5, 0x01);
++    };
++
++    void sleep(void) override { writeRegister8(0xA5, 0x03); };
++
++  private:
++    bool readRegister(uint8_t reg, uint8_t *data, size_t length)
++    {
++        Wire.beginTransmission(_cfg.i2c_addr);
++        Wire.write(reg);
++        if (Wire.endTransmission(false) != 0) {
++            return false;
++        }
++        size_t received = Wire.requestFrom((int)_cfg.i2c_addr, (int)length, (int)true);
++        if (received != length) {
++            while (Wire.available()) {
++                Wire.read();
++            }
++            return false;
++        }
++        for (size_t i = 0; i < length; ++i) {
++            data[i] = Wire.read();
++        }
++        return true;
++    }
++
++    bool writeRegister8(uint8_t reg, uint8_t value)
++    {
++        Wire.beginTransmission(_cfg.i2c_addr);
++        Wire.write(reg);
++        Wire.write(value);
++        return Wire.endTransmission(true) == 0;
++    }
++};
++} // namespace v1
++} // namespace lgfx
++#endif
+ class LGFX : public lgfx::LGFX_Device
+ {
+     lgfx::Panel_ST7789 _panel_instance;
+     lgfx::Bus_SPI _bus_instance;
+     lgfx::Light_PWM _light_instance;
+ #if HAS_TOUCHSCREEN
+-#if defined(T_WATCH_S3) || defined(ELECROW)
++#if defined(ARDUINO_NESSO_N1)
++    lgfx::TOUCH_NESSO_FT5X06 _touch_instance;
++#elif defined(T_WATCH_S3) || defined(ELECROW)
+     lgfx::Touch_FT5x06 _touch_instance;
+ #elif defined(HELTEC_V4_TFT) || defined(HELTEC_V4_R8_TFT)
+     lgfx::TOUCH_CHSC6X _touch_instance;
+@@ -683,8 +812,8 @@ class LGFX : public lgfx::LGFX_Device
+             cfg.invert = true;       // Set to true if the light/darkness of the panel is reversed
+             cfg.rgb_order = false;   // Set to true if the panel's red and blue are swapped
+             cfg.dlen_16bit =
+-                false; // Set to true for panels that transmit data length in 16-bit units with 16-bit parallel or SPI
+-#if defined(HAS_SDCARD)
++                false;             // Set to true for panels that transmit data length in 16-bit units with 16-bit parallel or SPI
++#if defined(HAS_SDCARD) || defined(ARDUINO_NESSO_N1)
+             cfg.bus_shared = true; // If the bus is shared with the SD card, set to true (bus control with drawJpgFile etc.)
+ #else
+             cfg.bus_shared = false;
+@@ -723,6 +852,10 @@ class LGFX : public lgfx::LGFX_Device
+             cfg.pin_int = SCREEN_TOUCH_INT;
+ #ifdef SCREEN_TOUCH_RST
+             cfg.pin_rst = SCREEN_TOUCH_RST;
++#endif
++#ifdef ARDUINO_NESSO_N1
++            // Nesso shares GPIO3 with the system IRQ line, so poll the touch controller instead.
++            cfg.pin_int = -1;
+ #endif
+             cfg.bus_shared = true;
+             cfg.offset_rotation = TFT_OFFSET_ROTATION;
+@@ -732,11 +865,21 @@ class LGFX : public lgfx::LGFX_Device
+             cfg.i2c_port = TOUCH_I2C_PORT;
+             cfg.i2c_addr = TOUCH_SLAVE_ADDRESS;
+ #ifdef SCREEN_TOUCH_USE_I2C1
++#ifdef ARDUINO_NESSO_N1
+             cfg.pin_sda = I2C_SDA1;
+             cfg.pin_scl = I2C_SCL1;
+ #else
++            cfg.pin_sda = I2C_SDA1;
++            cfg.pin_scl = I2C_SCL1;
++#endif
++#else
++#ifdef ARDUINO_NESSO_N1
+             cfg.pin_sda = I2C_SDA;
+             cfg.pin_scl = I2C_SCL;
++#else
++            cfg.pin_sda = I2C_SDA;
++            cfg.pin_scl = I2C_SCL;
++#endif
+ #endif
+             // cfg.freq = 400000;
+ 
+@@ -1506,6 +1649,8 @@ TFTDisplay::TFTDisplay(uint8_t address, int sda, int scl, OLEDDISPLAY_GEOMETRY g
+             virtPin, p); // We just leave this created object on the heap so it can stay watching virtPin and driving en_gpio
+         p = virtPin;
+     }
++#elif defined(TFT_BL_EXT)
++    GpioPin *p = new GpioExtPin(TFT_BL_EXT);
+ #else
+     GpioPin *p = new GpioVirtPin(); // Just simulate a pin
+ #endif
+diff --git a/src/graphics/draw/MenuHandler.cpp b/src/graphics/draw/MenuHandler.cpp
+index 0876f39f..3ddeb2fc 100644
+--- a/src/graphics/draw/MenuHandler.cpp
++++ b/src/graphics/draw/MenuHandler.cpp
+@@ -48,6 +48,8 @@
+ #include <functional>
+ #include <utility>
+ 
++extern uint16_t TFT_MESH;
++
+ namespace graphics
+ {
+ 
+@@ -2391,6 +2393,109 @@ void menuHandler::switchToMUIMenu()
+     screen->showOverlayBanner(bannerOptions);
+ }
+ 
++void menuHandler::TFTColorPickerMenu(OLEDDisplay *display)
++{
++    static const ScreenColorOption colorOptions[] = {
++        {"Back", OptionsAction::Back},
++        {"Default", OptionsAction::Select, ScreenColor(0, 0, 0, true)},
++        {"Meshtastic Green", OptionsAction::Select, ScreenColor(0x67, 0xEA, 0x94)},
++        {"Yellow", OptionsAction::Select, ScreenColor(255, 255, 128)},
++        {"Red", OptionsAction::Select, ScreenColor(255, 64, 64)},
++        {"Orange", OptionsAction::Select, ScreenColor(255, 160, 20)},
++        {"Purple", OptionsAction::Select, ScreenColor(204, 153, 255)},
++        {"Blue", OptionsAction::Select, ScreenColor(0, 0, 255)},
++        {"Teal", OptionsAction::Select, ScreenColor(16, 102, 102)},
++        {"Cyan", OptionsAction::Select, ScreenColor(0, 255, 255)},
++        {"Ice", OptionsAction::Select, ScreenColor(173, 216, 230)},
++        {"Pink", OptionsAction::Select, ScreenColor(255, 105, 180)},
++        {"White", OptionsAction::Select, ScreenColor(255, 255, 255)},
++        {"Gray", OptionsAction::Select, ScreenColor(128, 128, 128)},
++    };
++
++    constexpr size_t colorCount = sizeof(colorOptions) / sizeof(colorOptions[0]);
++    static std::array<const char *, colorCount> colorLabels{};
++
++    auto bannerOptions = createStaticBannerOptions(
++        "Select Screen Color", colorOptions, colorLabels, [display](const ScreenColorOption &option, int) -> void {
++            if (option.action == OptionsAction::Back) {
++                menuQueue = SystemBaseMenu;
++                screen->runNow();
++                return;
++            }
++
++            if (!option.hasValue) {
++                return;
++            }
++
++#if defined(HELTEC_MESH_NODE_T114) || defined(HELTEC_VISION_MASTER_T190) || defined(T_DECK) || defined(T_LORA_PAGER) ||          \
++    HAS_TFT || defined(HACKADAY_COMMUNICATOR) || defined(ARDUINO_NESSO_N1)
++            const ScreenColor &color = option.value;
++            if (color.useVariant) {
++                LOG_INFO("Setting color to system default or defined variant");
++            } else {
++                LOG_INFO("Setting color to %s", option.label);
++            }
++
++            uint8_t r = color.r;
++            uint8_t g = color.g;
++            uint8_t b = color.b;
++
++            display->setColor(BLACK);
++            display->fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
++            display->setColor(WHITE);
++
++            if (color.useVariant || (r == 0 && g == 0 && b == 0)) {
++#ifdef TFT_MESH_OVERRIDE
++                TFT_MESH = TFT_MESH_OVERRIDE;
++#else
++                TFT_MESH = COLOR565(255, 255, 128);
++#endif
++            } else {
++                TFT_MESH = COLOR565(r, g, b);
++            }
++
++#if defined(HELTEC_MESH_NODE_T114) || defined(HELTEC_VISION_MASTER_T190)
++            static_cast<ST7789Spi *>(screen->getDisplayDevice())->setRGB(TFT_MESH);
++#endif
++
++            screen->setFrames(graphics::Screen::FOCUS_SYSTEM);
++            if (color.useVariant || (r == 0 && g == 0 && b == 0)) {
++                uiconfig.screen_rgb_color = 0;
++            } else {
++                uiconfig.screen_rgb_color =
++                    (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
++            }
++            LOG_INFO("Storing Value of %d to uiconfig.screen_rgb_color", uiconfig.screen_rgb_color);
++            saveUIConfig();
++#endif
++        });
++
++    int initialSelection = 0;
++    if (uiconfig.screen_rgb_color == 0) {
++        initialSelection = 1;
++    } else {
++        uint32_t currentColor = uiconfig.screen_rgb_color;
++        for (size_t i = 0; i < colorCount; ++i) {
++            if (!colorOptions[i].hasValue) {
++                continue;
++            }
++            const ScreenColor &color = colorOptions[i].value;
++            if (color.useVariant) {
++                continue;
++            }
++            uint32_t encoded =
++                (static_cast<uint32_t>(color.r) << 16) | (static_cast<uint32_t>(color.g) << 8) | static_cast<uint32_t>(color.b);
++            if (encoded == currentColor) {
++                initialSelection = static_cast<int>(i);
++                break;
++            }
++        }
++    }
++    bannerOptions.InitialSelected = initialSelection;
++
++    screen->showOverlayBanner(bannerOptions);
++}
++
+ void menuHandler::rebootMenu()
+ {
+     static const char *optionsArray[] = {"Back", "Confirm"};
+@@ -2732,9 +2837,9 @@ void menuHandler::screenOptionsMenu()
+     bool hasSupportBrightness = false;
+ #endif
+ 
+-    enum optionsNumbers { Back, Brightness, FrameToggles, DisplayUnits, MessageBubbles, Theme };
+-    static const char *optionsArray[7] = {"Back"};
+-    static int optionsEnumArray[7] = {Back};
++    enum optionsNumbers { Back, Brightness, ScreenColor, FrameToggles, DisplayUnits, MessageBubbles, Theme };
++    static const char *optionsArray[8] = {"Back"};
++    static int optionsEnumArray[8] = {Back};
+     int options = 1;
+ 
+     // Only show brightness for B&W displays
+@@ -2743,6 +2848,13 @@ void menuHandler::screenOptionsMenu()
+         optionsEnumArray[options++] = Brightness;
+     }
+ 
++    // Only show screen color for TFT displays
++#if defined(HELTEC_MESH_NODE_T114) || defined(HELTEC_VISION_MASTER_T190) || defined(T_DECK) || defined(T_LORA_PAGER) ||          \
++    HAS_TFT || defined(HACKADAY_COMMUNICATOR) || defined(ARDUINO_NESSO_N1)
++    optionsArray[options] = "Screen Color";
++    optionsEnumArray[options++] = ScreenColor;
++#endif
++
+     optionsArray[options] = "Frame Visibility";
+     optionsEnumArray[options++] = FrameToggles;
+ 
+@@ -2766,6 +2878,9 @@ void menuHandler::screenOptionsMenu()
+         if (selected == Brightness) {
+             menuHandler::menuQueue = menuHandler::BrightnessPicker;
+             screen->runNow();
++        } else if (selected == ScreenColor) {
++            menuHandler::menuQueue = menuHandler::TftColorMenuPicker;
++            screen->runNow();
+         } else if (selected == FrameToggles) {
+             menuHandler::menuQueue = menuHandler::FrameToggles;
+             screen->runNow();
+@@ -3228,6 +3343,9 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
+     case MuiPicker:
+         switchToMUIMenu();
+         break;
++    case TftColorMenuPicker:
++        TFTColorPickerMenu(display);
++        break;
+     case BrightnessPicker:
+         BrightnessPickerMenu();
+         break;
+diff --git a/src/graphics/draw/MenuHandler.h b/src/graphics/draw/MenuHandler.h
+index a2cc14e6..18b555e8 100644
+--- a/src/graphics/draw/MenuHandler.h
++++ b/src/graphics/draw/MenuHandler.h
+@@ -31,6 +31,7 @@ class menuHandler
+         ResetNodeDbMenu,
+         BuzzerModeMenuPicker,
+         MuiPicker,
++        TftColorMenuPicker,
+         BrightnessPicker,
+         RebootMenu,
+         ShutdownMenu,
+@@ -103,6 +104,7 @@ class menuHandler
+     static void GPSPositionBroadcastMenu();
+     static void BuzzerModeMenu();
+     static void switchToMUIMenu();
++    static void TFTColorPickerMenu(OLEDDisplay *display);
+     static void nodeListMenu();
+     static void resetNodeDBMenu();
+     static void BrightnessPickerMenu();
+@@ -170,10 +172,23 @@ template <typename T> struct MenuOption {
+     MenuOption(const char *labelIn, OptionsAction actionIn) : label(labelIn), action(actionIn), hasValue(false), value() {}
+ };
+ 
++struct ScreenColor {
++    uint8_t r;
++    uint8_t g;
++    uint8_t b;
++    bool useVariant;
++
++    explicit ScreenColor(uint8_t rIn = 0, uint8_t gIn = 0, uint8_t bIn = 0, bool variantIn = false)
++        : r(rIn), g(gIn), b(bIn), useVariant(variantIn)
++    {
++    }
++};
++
+ using RadioPresetOption = MenuOption<meshtastic_Config_LoRaConfig_ModemPreset>;
+ using LoraRegionOption = MenuOption<meshtastic_Config_LoRaConfig_RegionCode>;
+ using TimezoneOption = MenuOption<const char *>;
+ using CompassOption = MenuOption<meshtastic_CompassMode>;
++using ScreenColorOption = MenuOption<ScreenColor>;
+ using GPSToggleOption = MenuOption<meshtastic_Config_PositionConfig_GpsMode>;
+ using GPSFormatOption = MenuOption<meshtastic_DeviceUIConfig_GpsCoordinateFormat>;
+ using NodeNameOption = MenuOption<bool>;
+diff --git a/src/input/InputBroker.cpp b/src/input/InputBroker.cpp
+index d1367165..92e3a97e 100644
+--- a/src/input/InputBroker.cpp
++++ b/src/input/InputBroker.cpp
+@@ -544,4 +544,8 @@ void InputBroker::Init()
+ #ifdef INPUTBROKER_EXPRESSLRSFIVEWAY_TYPE
+     expressLRSFiveWayInput = new ExpressLRSFiveWay();
+ #endif
++
++#if defined(ARDUINO_NESSO_N1)
++    i2cButton = new i2cButtonThread("i2cButtonThread");
++#endif
+ }
+diff --git a/src/input/i2cButton.cpp b/src/input/i2cButton.cpp
+index 0ae69d26..7dfbb6d3 100644
+--- a/src/input/i2cButton.cpp
++++ b/src/input/i2cButton.cpp
+@@ -2,7 +2,7 @@
+ #include "meshUtils.h"
+ 
+ #include "configuration.h"
+-#if defined(M5STACK_UNITC6L)
++#if defined(M5STACK_UNITC6L) || defined(ARDUINO_NESSO_N1)
+ 
+ #include "MeshService.h"
+ #include "Power.h"
+@@ -24,12 +24,41 @@ using namespace concurrency;
+ extern void i2c_read_byte(uint8_t addr, uint8_t reg, uint8_t *value);
+ 
+ extern void i2c_write_byte(uint8_t addr, uint8_t reg, uint8_t value);
++#if defined(ARDUINO_NESSO_N1)
++extern uint8_t gpio_ext_get(uint8_t address, uint8_t pin);
++#endif
+ 
+ #define PI4IO_M_ADDR 0x43
+-#define getbit(x, y) ((x) >> (y) & 0x01)
++#define getbit(x, y) ((x) >> (y)&0x01)
++#if defined(M5STACK_UNITC6L)
+ #define PI4IO_REG_IRQ_STA 0x13
+ #define PI4IO_REG_IN_STA 0x0F
+ #define PI4IO_REG_CHIP_RESET 0x01
++#endif
++
++#if defined(ARDUINO_NESSO_N1)
++static bool readPi4ioInputState(uint8_t *inputState)
++{
++    static uint32_t lastReadErrorLogMs = 0;
++    uint8_t state = 0;
++
++    for (uint8_t pin = 0; pin < 8; ++pin) {
++        uint8_t bit = gpio_ext_get(PI4IO_M_ADDR, pin);
++        if (bit > 1) {
++            uint32_t now = millis();
++            if (now - lastReadErrorLogMs > 5000) {
++                lastReadErrorLogMs = now;
++                LOG_WARN("PI4IO button expander read failed at 0x%02x", PI4IO_M_ADDR);
++            }
++            return false;
++        }
++        state |= (bit << pin);
++    }
++
++    *inputState = state;
++    return true;
++}
++#endif
+ 
+ i2cButtonThread::i2cButtonThread(const char *name) : OSThread(name)
+ {
+@@ -40,6 +69,93 @@ i2cButtonThread::i2cButtonThread(const char *name) : OSThread(name)
+ 
+ int32_t i2cButtonThread::runOnce()
+ {
++#if defined(ARDUINO_NESSO_N1)
++    static bool btn1_pressed = false;
++    static bool btn2_pressed = false;
++    static uint32_t press_start_time = 0;
++    static uint32_t press2_start_time = 0;
++    const uint32_t LONG_PRESS_TIME = 1000;
++    static bool long_press_triggered = false;
++    static bool long_press2_triggered = false;
++    static bool initialized = false;
++
++    uint8_t input_state;
++    if (!readPi4ioInputState(&input_state)) {
++        return 50;
++    }
++
++    if (!initialized) {
++        initialized = true;
++        btn1_pressed = !getbit(input_state, 0);
++        btn2_pressed = !getbit(input_state, 1);
++        return 50;
++    }
++
++    if (!getbit(input_state, 0)) {
++        if (!btn1_pressed) {
++            btn1_pressed = true;
++            press_start_time = millis();
++            long_press_triggered = false;
++        }
++    } else if (btn1_pressed) {
++        btn1_pressed = false;
++        uint32_t press_duration = millis() - press_start_time;
++        if (long_press_triggered) {
++            long_press_triggered = false;
++        } else if (press_duration < LONG_PRESS_TIME) {
++            InputEvent evt;
++            evt.source = "UserButton";
++            evt.inputEvent = INPUT_BROKER_USER_PRESS;
++            evt.kbchar = 0;
++            evt.touchX = 0;
++            evt.touchY = 0;
++            this->notifyObservers(&evt);
++        }
++    }
++
++    if (!getbit(input_state, 1)) {
++        if (!btn2_pressed) {
++            btn2_pressed = true;
++            press2_start_time = millis();
++            long_press2_triggered = false;
++        }
++    } else if (btn2_pressed) {
++        btn2_pressed = false;
++        uint32_t press_duration = millis() - press2_start_time;
++        if (long_press2_triggered) {
++            long_press2_triggered = false;
++        } else if (press_duration < LONG_PRESS_TIME) {
++            InputEvent evt;
++            evt.source = "BackButton";
++            evt.inputEvent = INPUT_BROKER_ALT_PRESS;
++            evt.kbchar = 0;
++            evt.touchX = 0;
++            evt.touchY = 0;
++            this->notifyObservers(&evt);
++        }
++    }
++
++    if (btn1_pressed && !long_press_triggered && (millis() - press_start_time >= LONG_PRESS_TIME)) {
++        long_press_triggered = true;
++        InputEvent evt;
++        evt.source = "UserButton";
++        evt.inputEvent = INPUT_BROKER_SELECT;
++        evt.kbchar = 0;
++        evt.touchX = 0;
++        evt.touchY = 0;
++        this->notifyObservers(&evt);
++    }
++    if (btn2_pressed && !long_press2_triggered && (millis() - press2_start_time >= LONG_PRESS_TIME)) {
++        long_press2_triggered = true;
++        InputEvent evt;
++        evt.source = "BackButton";
++        evt.inputEvent = INPUT_BROKER_ALT_LONG;
++        evt.kbchar = 0;
++        evt.touchX = 0;
++        evt.touchY = 0;
++        this->notifyObservers(&evt);
++    }
++#else
+     static bool btn1_pressed = false;
+     static uint32_t press_start_time = 0;
+     const uint32_t LONG_PRESS_TIME = 1000;
+@@ -90,6 +206,7 @@ int32_t i2cButtonThread::runOnce()
+         evt.touchY = 0;
+         this->notifyObservers(&evt);
+     }
++#endif
+     return 50;
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/input/i2cButton.h b/src/input/i2cButton.h
+index 1ad90860..992efd5c 100644
+--- a/src/input/i2cButton.h
++++ b/src/input/i2cButton.h
+@@ -4,7 +4,7 @@
+ #include "OneButton.h"
+ #include "concurrency/OSThread.h"
+ #include "configuration.h"
+-#if defined(M5STACK_UNITC6L)
++#if defined(M5STACK_UNITC6L) || defined(ARDUINO_NESSO_N1)
+ 
+ class i2cButtonThread : public Observable<const InputEvent *>, public concurrency::OSThread
+ {
+diff --git a/src/main.cpp b/src/main.cpp
+index d9f48187..af4fae8d 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -613,7 +613,7 @@ void setup()
+ #endif
+ #endif
+ 
+-#if defined(M5STACK_UNITC6L)
++#if defined(M5STACK_UNITC6L) || defined(ARDUINO_NESSO_N1)
+     pinMode(LORA_CS, OUTPUT);
+     digitalWrite(LORA_CS, 1);
+     c6l_init();
+diff --git a/src/mesh/generated/meshtastic/telemetry.pb.h b/src/mesh/generated/meshtastic/telemetry.pb.h
+index 0f8d9acd..f752104d 100644
+--- a/src/mesh/generated/meshtastic/telemetry.pb.h
++++ b/src/mesh/generated/meshtastic/telemetry.pb.h
+@@ -127,7 +127,9 @@ typedef enum _meshtastic_TelemetrySensorType {
+     /* Sensirion SEN6X PM/RHT/VOC/NOx/CO2/HCHO sensor family (SEN62, SEN63C, SEN65, SEN66, SEN68, SEN69C) */
+     meshtastic_TelemetrySensorType_SEN6X = 56,
+     /* AS3935 Franklin lightning sensor */
+-    meshtastic_TelemetrySensorType_AS3935 = 57
++    meshtastic_TelemetrySensorType_AS3935 = 57,
++    /* QMP6988 high accuracy pressure and temperature sensor */
++    meshtastic_TelemetrySensorType_QMP6988 = 58
+ } meshtastic_TelemetrySensorType;
+ 
+ /* Struct definitions */
+@@ -646,8 +648,8 @@ extern "C" {
+ 
+ /* Helper constants for enums */
+ #define _meshtastic_TelemetrySensorType_MIN meshtastic_TelemetrySensorType_SENSOR_UNSET
+-#define _meshtastic_TelemetrySensorType_MAX meshtastic_TelemetrySensorType_AS3935
+-#define _meshtastic_TelemetrySensorType_ARRAYSIZE ((meshtastic_TelemetrySensorType)(meshtastic_TelemetrySensorType_AS3935+1))
++#define _meshtastic_TelemetrySensorType_MAX meshtastic_TelemetrySensorType_QMP6988
++#define _meshtastic_TelemetrySensorType_ARRAYSIZE ((meshtastic_TelemetrySensorType)(meshtastic_TelemetrySensorType_QMP6988+1))
+ 
+ 
+ 
+diff --git a/src/modules/SerialModule.cpp b/src/modules/SerialModule.cpp
+index 6828a53f..65c7eb50 100644
+--- a/src/modules/SerialModule.cpp
++++ b/src/modules/SerialModule.cpp
+@@ -97,7 +97,11 @@ SerialModuleRadio *serialModuleRadio;
+ #elif SERIAL_PRINT_PORT == 1
+ #define SERIAL_PRINT_OBJECT Serial1
+ #elif SERIAL_PRINT_PORT == 2
++#if defined(CONFIG_IDF_TARGET_ESP32C6)
++#define SERIAL_PRINT_OBJECT Serial1
++#else
+ #define SERIAL_PRINT_OBJECT Serial2
++#endif
+ #else
+ #error "Unsupported SERIAL_PRINT_PORT value. Allowed values are 0, 1, or 2."
+ #endif
+diff --git a/src/modules/Telemetry/EnvironmentTelemetry.cpp b/src/modules/Telemetry/EnvironmentTelemetry.cpp
+index 50f00ea7..b799833a 100644
+--- a/src/modules/Telemetry/EnvironmentTelemetry.cpp
++++ b/src/modules/Telemetry/EnvironmentTelemetry.cpp
+@@ -63,6 +63,8 @@ extern void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const c
+ #include "Sensor/DPS310Sensor.h"
+ #endif
+ 
++#include "Sensor/QMP6988Sensor.h"
++
+ #if __has_include(<Adafruit_MCP9808.h>)
+ #include "Sensor/MCP9808Sensor.h"
+ #endif
+@@ -324,6 +326,7 @@ void EnvironmentTelemetryModule::i2cScanFinished(ScanI2C *i2cScanner)
+ #if __has_include(<Adafruit_DPS310.h>)
+     addSensor<DPS310Sensor>(i2cScanner, ScanI2C::DeviceType::DPS310);
+ #endif
++    addSensor<QMP6988Sensor>(i2cScanner, ScanI2C::DeviceType::QMP6988);
+ #if __has_include(<Adafruit_MCP9808.h>)
+     addSensor<MCP9808Sensor>(i2cScanner, ScanI2C::DeviceType::MCP9808);
+ #endif
+diff --git a/src/modules/Telemetry/Sensor/QMP6988Sensor.cpp b/src/modules/Telemetry/Sensor/QMP6988Sensor.cpp
+new file mode 100644
+index 00000000..05d9af66
+--- /dev/null
++++ b/src/modules/Telemetry/Sensor/QMP6988Sensor.cpp
+@@ -0,0 +1,294 @@
++#include "configuration.h"
++
++#if !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
++
++#include "../mesh/generated/meshtastic/telemetry.pb.h"
++#include "QMP6988Sensor.h"
++#include "TelemetrySensor.h"
++#include <Wire.h>
++
++namespace
++{
++
++constexpr uint8_t QMP6988_CHIP_ID = 0x5C;
++constexpr uint8_t QMP6988_CHIP_ID_REG = 0xD1;
++constexpr uint8_t QMP6988_RESET_REG = 0xE0;
++constexpr uint8_t QMP6988_CONFIG_REG = 0xF1;
++constexpr uint8_t QMP6988_CTRL_MEAS_REG = 0xF4;
++constexpr uint8_t QMP6988_PRESSURE_MSB_REG = 0xF7;
++constexpr uint8_t QMP6988_CALIBRATION_START_REG = 0xA0;
++constexpr uint8_t QMP6988_CALIBRATION_LENGTH = 25;
++
++constexpr uint8_t QMP6988_MODE_NORMAL = 0x03;
++constexpr uint8_t QMP6988_FILTER_4 = 0x02;
++constexpr uint8_t QMP6988_OVERSAMPLING_1X = 0x01;
++constexpr uint8_t QMP6988_OVERSAMPLING_8X = 0x04;
++
++constexpr int32_t QMP6988_SUBTRACTOR = 8388608;
++
++} // namespace
++
++QMP6988Sensor::QMP6988Sensor() : TelemetrySensor(meshtastic_TelemetrySensorType_QMP6988, "QMP6988") {}
++
++bool QMP6988Sensor::writeByte(uint8_t reg, uint8_t value)
++{
++    bus->beginTransmission(address);
++    bus->write(reg);
++    bus->write(value);
++    return bus->endTransmission() == 0;
++}
++
++bool QMP6988Sensor::readByte(uint8_t reg, uint8_t &value)
++{
++    if (!readBytes(reg, &value, 1)) {
++        return false;
++    }
++    return true;
++}
++
++bool QMP6988Sensor::readBytes(uint8_t reg, uint8_t *buffer, uint8_t length)
++{
++    bus->beginTransmission(address);
++    bus->write(reg);
++    if (bus->endTransmission() != 0) {
++        return false;
++    }
++
++    if (bus->requestFrom((int)address, (int)length) != length) {
++        return false;
++    }
++
++    for (uint8_t i = 0; i < length; ++i) {
++        if (!bus->available()) {
++            return false;
++        }
++        buffer[i] = bus->read();
++    }
++
++    return true;
++}
++
++bool QMP6988Sensor::reset()
++{
++    if (!writeByte(QMP6988_RESET_REG, 0xE6)) {
++        return false;
++    }
++    delay(20);
++    writeByte(QMP6988_RESET_REG, 0x00);
++    return true;
++}
++
++bool QMP6988Sensor::readCalibrationData()
++{
++    uint8_t data[QMP6988_CALIBRATION_LENGTH] = {};
++    for (uint8_t i = 0; i < sizeof(data); ++i) {
++        if (!readBytes(QMP6988_CALIBRATION_START_REG + i, &data[i], 1)) {
++            return false;
++        }
++    }
++
++    calibration.a0 = (int32_t)(((data[18] << 12) | (data[19] << 4) | (data[24] & 0x0F)) << 12) >> 12;
++    calibration.a1 = (int16_t)((data[20] << 8) | data[21]);
++    calibration.a2 = (int16_t)((data[22] << 8) | data[23]);
++    calibration.b00 = (int32_t)(((data[0] << 12) | (data[1] << 4) | ((data[24] & 0xF0) >> 4)) << 12) >> 12;
++    calibration.bt1 = (int16_t)((data[2] << 8) | data[3]);
++    calibration.bt2 = (int16_t)((data[4] << 8) | data[5]);
++    calibration.bp1 = (int16_t)((data[6] << 8) | data[7]);
++    calibration.b11 = (int16_t)((data[8] << 8) | data[9]);
++    calibration.bp2 = (int16_t)((data[10] << 8) | data[11]);
++    calibration.b12 = (int16_t)((data[12] << 8) | data[13]);
++    calibration.b21 = (int16_t)((data[14] << 8) | data[15]);
++    calibration.bp3 = (int16_t)((data[16] << 8) | data[17]);
++
++    integerCalibration.a0 = calibration.a0;
++    integerCalibration.b00 = calibration.b00;
++    integerCalibration.a1 = 3608L * calibration.a1 - 1731677965L;
++    integerCalibration.a2 = 16889L * calibration.a2 - 87619360L;
++    integerCalibration.bt1 = 2982LL * calibration.bt1 + 107370906LL;
++    integerCalibration.bt2 = 329854LL * calibration.bt2 + 108083093LL;
++    integerCalibration.bp1 = 19923LL * calibration.bp1 + 1133836764LL;
++    integerCalibration.b11 = 2406LL * calibration.b11 + 118215883LL;
++    integerCalibration.bp2 = 3079LL * calibration.bp2 - 181579595LL;
++    integerCalibration.b12 = 6846LL * calibration.b12 + 85590281LL;
++    integerCalibration.b21 = 13836LL * calibration.b21 + 79333336LL;
++    integerCalibration.bp3 = 2915LL * calibration.bp3 + 157155561LL;
++
++    return true;
++}
++
++void QMP6988Sensor::setPowerMode(uint8_t powerMode)
++{
++    uint8_t control = 0;
++    if (!readByte(QMP6988_CTRL_MEAS_REG, control)) {
++        return;
++    }
++
++    control &= 0xFC;
++    control |= (powerMode & 0x03);
++    writeByte(QMP6988_CTRL_MEAS_REG, control);
++    delay(20);
++}
++
++void QMP6988Sensor::setFilter(uint8_t filter)
++{
++    writeByte(QMP6988_CONFIG_REG, filter & 0x03);
++    delay(20);
++}
++
++void QMP6988Sensor::setOversamplingPressure(uint8_t oversampling)
++{
++    uint8_t control = 0;
++    if (!readByte(QMP6988_CTRL_MEAS_REG, control)) {
++        return;
++    }
++
++    control &= 0xE3;
++    control |= (oversampling << 2);
++    writeByte(QMP6988_CTRL_MEAS_REG, control);
++    delay(20);
++}
++
++void QMP6988Sensor::setOversamplingTemperature(uint8_t oversampling)
++{
++    uint8_t control = 0;
++    if (!readByte(QMP6988_CTRL_MEAS_REG, control)) {
++        return;
++    }
++
++    control &= 0x1F;
++    control |= (oversampling << 5);
++    writeByte(QMP6988_CTRL_MEAS_REG, control);
++    delay(20);
++}
++
++int16_t QMP6988Sensor::convertTemperature(int32_t rawTemperature) const
++{
++    int64_t wk1 = (int64_t)integerCalibration.a1 * rawTemperature;
++    int64_t wk2 = ((int64_t)integerCalibration.a2 * rawTemperature) >> 14;
++    wk2 = (wk2 * rawTemperature) >> 10;
++    wk2 = ((wk1 + wk2) / 32767) >> 19;
++    return (int16_t)((integerCalibration.a0 + wk2) >> 4);
++}
++
++int32_t QMP6988Sensor::convertPressure(int32_t rawPressure, int16_t compensatedTemperature) const
++{
++    int64_t wk1 = (int64_t)integerCalibration.bt1 * compensatedTemperature;
++    int64_t wk2 = ((int64_t)integerCalibration.bp1 * rawPressure) >> 5;
++    wk1 += wk2;
++
++    wk2 = ((int64_t)integerCalibration.bt2 * compensatedTemperature) >> 1;
++    wk2 = (wk2 * compensatedTemperature) >> 8;
++    int64_t wk3 = wk2;
++
++    wk2 = ((int64_t)integerCalibration.b11 * compensatedTemperature) >> 4;
++    wk2 = (wk2 * rawPressure) >> 1;
++    wk3 += wk2;
++
++    wk2 = ((int64_t)integerCalibration.bp2 * rawPressure) >> 13;
++    wk2 = (wk2 * rawPressure) >> 1;
++    wk3 += wk2;
++    wk1 += wk3 >> 14;
++
++    wk2 = (int64_t)integerCalibration.b12 * compensatedTemperature;
++    wk2 = (wk2 * compensatedTemperature) >> 22;
++    wk2 = (wk2 * rawPressure) >> 1;
++    wk3 = wk2;
++
++    wk2 = ((int64_t)integerCalibration.b21 * compensatedTemperature) >> 6;
++    wk2 = (wk2 * rawPressure) >> 23;
++    wk2 = (wk2 * rawPressure) >> 1;
++    wk3 += wk2;
++
++    wk2 = ((int64_t)integerCalibration.bp3 * rawPressure) >> 12;
++    wk2 = (wk2 * rawPressure) >> 23;
++    wk2 = wk2 * rawPressure;
++    wk3 += wk2;
++
++    wk1 += wk3 >> 15;
++    wk1 /= 32767;
++    wk1 >>= 11;
++    wk1 += integerCalibration.b00;
++
++    return (int32_t)wk1;
++}
++
++bool QMP6988Sensor::readRawMeasurement(int32_t &rawPressure, int32_t &rawTemperature)
++{
++    uint8_t data[6] = {};
++    if (!readBytes(QMP6988_PRESSURE_MSB_REG, data, sizeof(data))) {
++        return false;
++    }
++
++    uint32_t pressure = ((uint32_t)data[0] << 16) | ((uint16_t)data[1] << 8) | data[2];
++    uint32_t temperature = ((uint32_t)data[3] << 16) | ((uint16_t)data[4] << 8) | data[5];
++
++    rawPressure = (int32_t)pressure - QMP6988_SUBTRACTOR;
++    rawTemperature = (int32_t)temperature - QMP6988_SUBTRACTOR;
++    return true;
++}
++
++bool QMP6988Sensor::initDevice(TwoWire *bus, ScanI2C::FoundDevice *dev)
++{
++    LOG_INFO("Init sensor: %s", sensorName);
++
++    this->bus = bus;
++    address = dev->address.address;
++
++    uint8_t chipId = 0;
++    if (!readByte(QMP6988_CHIP_ID_REG, chipId) || chipId != QMP6988_CHIP_ID) {
++        LOG_ERROR("%s: chip id mismatch at 0x%x", sensorName, address);
++        initI2CSensor();
++        return status;
++    }
++
++    if (!reset()) {
++        LOG_DEBUG("%s: reset failed at 0x%x, continuing without reset", sensorName, address);
++    }
++
++    if (!readCalibrationData()) {
++        LOG_ERROR("%s: calibration read failed at 0x%x", sensorName, address);
++        initI2CSensor();
++        return status;
++    }
++
++    status = true;
++    if (!status) {
++        LOG_ERROR("%s: init failed at 0x%x", sensorName, address);
++        initI2CSensor();
++        return status;
++    }
++
++    setPowerMode(QMP6988_MODE_NORMAL);
++    setFilter(QMP6988_FILTER_4);
++    setOversamplingPressure(QMP6988_OVERSAMPLING_8X);
++    setOversamplingTemperature(QMP6988_OVERSAMPLING_1X);
++
++    initI2CSensor();
++    return status;
++}
++
++bool QMP6988Sensor::getMetrics(meshtastic_Telemetry *measurement)
++{
++    int32_t rawPressure = 0;
++    int32_t rawTemperature = 0;
++
++    if (!readRawMeasurement(rawPressure, rawTemperature)) {
++        LOG_ERROR("%s: read sample failed", sensorName);
++        return false;
++    }
++
++    int16_t compensatedTemperature = convertTemperature(rawTemperature);
++    int32_t compensatedPressure = convertPressure(rawPressure, compensatedTemperature);
++
++    measurement->variant.environment_metrics.has_temperature = true;
++    measurement->variant.environment_metrics.has_barometric_pressure = true;
++    measurement->variant.environment_metrics.temperature = (float)compensatedTemperature / 256.0f;
++    measurement->variant.environment_metrics.barometric_pressure = (float)compensatedPressure / 1600.0f;
++
++    LOG_INFO("%s: Got temp:%fdegC pressure:%fhPa", sensorName, measurement->variant.environment_metrics.temperature,
++             measurement->variant.environment_metrics.barometric_pressure);
++
++    return true;
++}
++
++#endif
+diff --git a/src/modules/Telemetry/Sensor/QMP6988Sensor.h b/src/modules/Telemetry/Sensor/QMP6988Sensor.h
+new file mode 100644
+index 00000000..11ad8184
+--- /dev/null
++++ b/src/modules/Telemetry/Sensor/QMP6988Sensor.h
+@@ -0,0 +1,67 @@
++#include "configuration.h"
++
++#if !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
++
++#pragma once
++
++#include "../mesh/generated/meshtastic/telemetry.pb.h"
++#include "TelemetrySensor.h"
++
++class QMP6988Sensor : public TelemetrySensor
++{
++  public:
++    QMP6988Sensor();
++    bool getMetrics(meshtastic_Telemetry *measurement) override;
++    bool initDevice(TwoWire *bus, ScanI2C::FoundDevice *dev) override;
++
++  private:
++    struct CalibrationData {
++        int32_t a0;
++        int16_t a1;
++        int16_t a2;
++        int32_t b00;
++        int16_t bt1;
++        int16_t bt2;
++        int16_t bp1;
++        int16_t b11;
++        int16_t bp2;
++        int16_t b12;
++        int16_t b21;
++        int16_t bp3;
++    };
++
++    struct IntegerCalibrationData {
++        int32_t a0;
++        int32_t b00;
++        int32_t a1;
++        int32_t a2;
++        int64_t bt1;
++        int64_t bt2;
++        int64_t bp1;
++        int64_t b11;
++        int64_t bp2;
++        int64_t b12;
++        int64_t b21;
++        int64_t bp3;
++    };
++
++    bool readBytes(uint8_t reg, uint8_t *buffer, uint8_t length);
++    bool writeByte(uint8_t reg, uint8_t value);
++    bool readByte(uint8_t reg, uint8_t &value);
++    bool reset();
++    bool readCalibrationData();
++    void setPowerMode(uint8_t powerMode);
++    void setFilter(uint8_t filter);
++    void setOversamplingPressure(uint8_t oversampling);
++    void setOversamplingTemperature(uint8_t oversampling);
++    int16_t convertTemperature(int32_t rawTemperature) const;
++    int32_t convertPressure(int32_t rawPressure, int16_t compensatedTemperature) const;
++    bool readRawMeasurement(int32_t &rawPressure, int32_t &rawTemperature);
++
++    TwoWire *bus{};
++    uint8_t address{};
++    CalibrationData calibration{};
++    IntegerCalibrationData integerCalibration{};
++};
++
++#endif
+diff --git a/variants/esp32c6/arduino_nesso_n1/GpioExtLogic.cpp b/variants/esp32c6/arduino_nesso_n1/GpioExtLogic.cpp
+new file mode 100644
+index 00000000..0f9a1a3f
+--- /dev/null
++++ b/variants/esp32c6/arduino_nesso_n1/GpioExtLogic.cpp
+@@ -0,0 +1,2 @@
++// GpioExtPin is header-only. Keep this variant source lightweight so the
++// ESP-IDF variant build does not pull in the firmware protobuf include chain.
+diff --git a/variants/esp32c6/arduino_nesso_n1/GpioExtLogic.h b/variants/esp32c6/arduino_nesso_n1/GpioExtLogic.h
+new file mode 100644
+index 00000000..040b59ce
+--- /dev/null
++++ b/variants/esp32c6/arduino_nesso_n1/GpioExtLogic.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include <stdint.h>
++
++#include "GpioLogic.h"
++
++void gpio_ext_set(uint8_t address, uint8_t pin, bool value);
++uint8_t gpio_ext_get(uint8_t address, uint8_t pin);
++
++class GpioExtPin : public GpioPin
++{
++  public:
++    GpioExtPin(uint16_t _pin) : pin(_pin & 0x3F), address(_pin & 0x100 ? 0x44 : 0x43){};
++    uint8_t pin;
++    uint8_t address;
++
++    void set(bool value) override { gpio_ext_set(address, pin, value); }
++    uint8_t get() { return gpio_ext_get(address, pin); }
++};
+diff --git a/variants/esp32c6/arduino_nesso_n1/README.md b/variants/esp32c6/arduino_nesso_n1/README.md
+new file mode 100644
+index 00000000..17f58ba5
+--- /dev/null
++++ b/variants/esp32c6/arduino_nesso_n1/README.md
+@@ -0,0 +1,76 @@
++# Arduino Nesso N1 Support Notes
++
++This document summarizes the Nesso N1-specific firmware support and the current
++known limitations.
++
++## Supported hardware
++
++- ESP32-C6 based Nesso N1 board variant: `arduino-nesso-n1`
++- SX1262 LoRa radio
++- TFT display
++- Touchscreen, enabled by default
++- M5Stack CardKB through the existing I2C keyboard path
++- Environmental telemetry through the Grove/I2C port, for sensors already
++  supported by Meshtastic
++
++## Known-good baseline
++
++For stable field testing, use the 2.7-based Nesso N1 branch state at:
++
++```text
++263e1c6f2da1a72f6a302e6a974896d1241b9978
++```
++
++That commit is based on firmware 2.7.23 and includes the verified Nesso N1
++support work, including display, touch input, CardKB, and QMP6988 telemetry.
++
++The current 2.8-based branch is useful for development and upstream follow-up,
++but should be treated as a revalidation target until the ESP32-C6 behavior is
++confirmed again on hardware.
++
++## Build options
++
++The touchscreen can be disabled at build time:
++
++```ini
++-D HAS_TOUCHSCREEN=0
++```
++
++The default variant keeps it enabled:
++
++```cpp
++#define HAS_TOUCHSCREEN 1
++```
++
++The define is intentionally overrideable from PlatformIO build flags.
++
++## I2C address notes
++
++The Nesso touchscreen uses I2C address `0x38`, which is also the default AHT10
++address in Meshtastic. For this board, `0x38` is ignored by the AHT10
++auto-detection path to avoid registering the touchscreen as a broken AHT10
++environment sensor.
++
++CardKB uses the existing Meshtastic I2C keyboard detection and does not require a
++Nesso-specific driver.
++
++## LoRa notes
++
++The board has been validated with the app's LoRa frequency slot set explicitly.
++A mismatch between the configured slot and the other mesh nodes can look like
++successful local TX with no network join.
++
++## Environmental sensor notes
++
++M5Stack Unit ENV and Unit ENV Pro can work through existing Meshtastic sensor
++drivers when their onboard sensors are supported.
++
++M5Stack Unit ENV III is not compatible with the Nesso N1 over the Qwiic/Grove
++port. The board's onboard E1 expander already uses I2C address `0x44`, and ENV
++III's SHT30 temperature/humidity sensor also uses `0x44`, so both devices cannot
++share the same bus. This matches the limitation documented by Arduino for the
++Nesso N1 user manual.
++
++QMP6988 pressure readings are supported, but ENV III still remains incomplete on
++Nesso N1 because the SHT30 side cannot coexist on the same bus due to the
++`0x44` address conflict.
+diff --git a/variants/esp32c6/arduino_nesso_n1/pins_arduino.h b/variants/esp32c6/arduino_nesso_n1/pins_arduino.h
+new file mode 100644
+index 00000000..9cb52891
+--- /dev/null
++++ b/variants/esp32c6/arduino_nesso_n1/pins_arduino.h
+@@ -0,0 +1,22 @@
++#ifndef Pins_Arduino_h
++#define Pins_Arduino_h
++
++#include <stdint.h>
++
++#define USB_VID 0x303A
++#define USB_PID 0x1001
++
++static const uint8_t TX = -1;
++static const uint8_t RX = -1;
++
++static const uint8_t SDA = 10;
++static const uint8_t SCL = 8;
++
++// Default SPI will be mapped to Radio
++static const uint8_t MOSI = 21;
++static const uint8_t MISO = 22;
++static const uint8_t SCK = 20;
++static const uint8_t SS = 23;
++
++#endif /* Pins_Arduino_h */
++
+diff --git a/variants/esp32c6/arduino_nesso_n1/platformio.ini b/variants/esp32c6/arduino_nesso_n1/platformio.ini
+new file mode 100644
+index 00000000..e512436d
+--- /dev/null
++++ b/variants/esp32c6/arduino_nesso_n1/platformio.ini
+@@ -0,0 +1,34 @@
++[env:arduino-nesso-n1]
++extends = esp32c6_base
++board = esp32-c6-devkitc-1
++board_build.partitions = partition-table-8MB.csv
++board_upload.flash_size = 8MB
++upload_protocol = esptool
++build_unflags =
++  -D HAS_BLUETOOTH
++  -D MESHTASTIC_EXCLUDE_BLUETOOTH
++  -D HAS_WIFI
++lib_deps =
++  ${esp32c6_base.lib_deps}
++  lovyan03/LovyanGFX@^1.2.0
++  https://github.com/mverch67/BQ27220/archive/07d92be846abd8a0258a50c23198dac0858b22ed.zip
++build_flags = 
++  ${esp32c6_base.build_flags}
++  -D PRIVATE_HW
++  -D ARDUINO_NESSO_N1
++  ; Uncomment to disable the touchscreen at build time
++  ; -D HAS_TOUCHSCREEN=0
++  -I variants/esp32c6/arduino_nesso_n1
++  -DMESHTASTIC_EXCLUDE_PAXCOUNTER=1
++  -DSOC_USB_OTG_SUPPORTED=1
++  -DARDUINO_USB_CDC_ON_BOOT=1
++  -DARDUINO_USB_MODE=1
++  -D HAS_BLUETOOTH=1
++  -D HAS_WIRE=1
++  -D SPI_3_WIRE=0
++  -D _ESP_LOGLEVEL_=5
++monitor_speed=115200
++lib_ignore =
++  libpax
++build_src_filter = 
++ ${esp32c6_base.build_src_filter} +<../variants/esp32c6/arduino_nesso_n1>
+diff --git a/variants/esp32c6/arduino_nesso_n1/variant.cpp b/variants/esp32c6/arduino_nesso_n1/variant.cpp
+new file mode 100644
+index 00000000..7d44c243
+--- /dev/null
++++ b/variants/esp32c6/arduino_nesso_n1/variant.cpp
+@@ -0,0 +1,138 @@
++#include "driver/gpio.h"
++#include <Arduino.h>
++#include <Wire.h>
++// I2C device addr
++#define PI4IO_M_ADDR 0x43
++#define PI4IO_M_ADDR2 0x44
++
++// PI4IO registers
++#define PI4IO_REG_CHIP_RESET 0x01
++#define PI4IO_REG_IO_DIR 0x03
++#define PI4IO_REG_OUT_SET 0x05
++#define PI4IO_REG_OUT_H_IM 0x07
++#define PI4IO_REG_IN_DEF_STA 0x09
++#define PI4IO_REG_PULL_EN 0x0B
++#define PI4IO_REG_PULL_SEL 0x0D
++#define PI4IO_REG_IN_STA 0x0F
++#define PI4IO_REG_INT_MASK 0x11
++#define PI4IO_REG_IRQ_STA 0x13
++// PI4IO
++
++#define setbit(x, y) x |= (0x01 << y)
++#define clrbit(x, y) x &= ~(0x01 << y)
++#define reversebit(x, y) x ^= (0x01 << y)
++#define getbit(x, y) ((x) >> (y)&0x01)
++
++void i2c_read_byte(uint8_t addr, uint8_t reg, uint8_t *value)
++{
++    Wire.beginTransmission(addr);
++    Wire.write(reg);
++    Wire.endTransmission();
++    Wire.requestFrom(addr, 1);
++    *value = Wire.read();
++}
++
++/*******************************************************************/
++void i2c_write_byte(uint8_t addr, uint8_t reg, uint8_t value)
++{
++    Wire.beginTransmission(addr);
++    Wire.write(reg);
++    Wire.write(value);
++    Wire.endTransmission();
++}
++/*******************************************************************/
++void c6l_init()
++{
++    // P7 LoRa Reset
++    // P6 RF Switch
++    // P5 LNA Enable
++    // P1 KEY2
++    // P0 KEY1
++    // P107 LED_BUILTIN
++    // P106 LCD_BACKLIGHT
++    // P105 VIN_DETECT
++    // P102 GROVE_POWER_EN
++    // P101 LCD_RESET
++    // P100 POWEROFF
++
++    printf("pi4io_init\n");
++    uint8_t in_data;
++    i2c_write_byte(PI4IO_M_ADDR, PI4IO_REG_CHIP_RESET, 0xFF);
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_read_byte(PI4IO_M_ADDR, PI4IO_REG_CHIP_RESET, &in_data);
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR, PI4IO_REG_IO_DIR, 0b11100000); // 0: input 1: output
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR, PI4IO_REG_OUT_H_IM, 0b00011100); // Output High-Impedance, 1 high-impedance
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR, PI4IO_REG_PULL_SEL, 0b11100011); // pull up/down select, 0 down, 1 up
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR, PI4IO_REG_PULL_EN, 0b11100011); // pull up/down enable, 0 disable, 1 enable
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR, PI4IO_REG_IN_DEF_STA, 0b00000011); // P0 P1 Default state HIGH, interrupt when pressed
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR, PI4IO_REG_INT_MASK, 0b11111100); // P0 P1 Interrupt 0 enable, 1 disable
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR, PI4IO_REG_OUT_SET, 0b11100000); // default output to 0
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_read_byte(PI4IO_M_ADDR, PI4IO_REG_IRQ_STA, &in_data); // Read IRQ_STA clear register
++
++    i2c_read_byte(PI4IO_M_ADDR, PI4IO_REG_OUT_SET, &in_data);
++    setbit(in_data, 6); // HIGH
++    i2c_write_byte(PI4IO_M_ADDR, PI4IO_REG_OUT_SET, in_data);
++
++    i2c_write_byte(PI4IO_M_ADDR2, PI4IO_REG_CHIP_RESET, 0xFF);
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_read_byte(PI4IO_M_ADDR2, PI4IO_REG_CHIP_RESET, &in_data);
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR2, PI4IO_REG_IO_DIR, 0b11000110); // 0: input 1: output
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR2, PI4IO_REG_OUT_H_IM, 0b00111000); // Output High-Impedance, 1 high-impedance
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR2, PI4IO_REG_PULL_SEL, 0b11000111); // pull up/down select, 0 down, 1 up
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR2, PI4IO_REG_PULL_EN, 0b11000111); // pull up/down enable, 0 disable, 1 enable
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR2, PI4IO_REG_IN_DEF_STA, 0b00000000); // P0 P1 Default state HIGH, interrupt when pressed
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR2, PI4IO_REG_INT_MASK, 0b11111111); // P0 P1 Interrupt 0 enable, 1 disable
++    vTaskDelay(10 / portTICK_PERIOD_MS);
++    i2c_write_byte(PI4IO_M_ADDR2, PI4IO_REG_OUT_SET, 0b11000110); // default output to 0
++
++    // The LCD reset line is PI4IO_M_ADDR2/P1.  The display can remain powered
++    // while the ESP32 is reset or reflashed, so release-only initialization is
++    // not sufficient; provide the ST7789 with a real reset pulse.
++    i2c_read_byte(PI4IO_M_ADDR2, PI4IO_REG_OUT_SET, &in_data);
++    clrbit(in_data, 1);
++    i2c_write_byte(PI4IO_M_ADDR2, PI4IO_REG_OUT_SET, in_data);
++    vTaskDelay(100 / portTICK_PERIOD_MS);
++    setbit(in_data, 1);
++    i2c_write_byte(PI4IO_M_ADDR2, PI4IO_REG_OUT_SET, in_data);
++    vTaskDelay(120 / portTICK_PERIOD_MS);
++
++    // AW32001E - address 0x49
++    // charge current 256mA (default 128mA)
++    i2c_write_byte(0x49, 0x2, 0x1f);
++    // charge voltage 4.200(default)
++    // disable watch dog timer (default: 0x1f)
++    i2c_write_byte(0x49, 0x5, 0x1a);
++    // UVLO: 2.580 (default: 2.760), charge enable, disable HIZ (default: 0xac)
++    i2c_write_byte(0x49, 0x1, 0xa2);
++    // DPM 4.520 (default)
++    i2c_write_byte(0x49, 0x0, 0x8f);
++}
++
++void gpio_ext_set(uint8_t address, uint8_t pin, bool value)
++{
++    uint8_t in_data;
++    i2c_read_byte(address, PI4IO_REG_OUT_SET, &in_data);
++    value ? setbit(in_data, pin) : clrbit(in_data, pin);
++    i2c_write_byte(address, PI4IO_REG_OUT_SET, in_data);
++}
++
++uint8_t gpio_ext_get(uint8_t address, uint8_t pin)
++{
++    uint8_t in_data;
++    i2c_read_byte(address, PI4IO_REG_IN_STA, &in_data);
++    return getbit(in_data, pin);
++}
+diff --git a/variants/esp32c6/arduino_nesso_n1/variant.h b/variants/esp32c6/arduino_nesso_n1/variant.h
+new file mode 100644
+index 00000000..35871796
+--- /dev/null
++++ b/variants/esp32c6/arduino_nesso_n1/variant.h
+@@ -0,0 +1,90 @@
++void c6l_init();
++void gpio_ext_set(uint8_t address, uint8_t pin, bool value);
++uint8_t gpio_ext_get(uint8_t address, uint8_t pin);
++
++#define HAS_GPS 0
++#define GPS_RX_PIN -1
++#define GPS_TX_PIN -1
++
++#define I2C_SDA 10
++#define I2C_SCL 8
++
++#define LCD_CS 17
++#define LCD_RS 16
++#define SYS_IRQ 3
++
++#define MOSI 21
++#define MISO 22
++#define SCK 20
++
++#define PIN_BUZZER 11
++
++#define IO_EXPANDER 0x40
++#define LCD_BACKLIGHT 0x106
++
++// #define BUTTON_PIN 9
++#define BUTTON_EXTENDER
++
++#undef LORA_SCK
++#undef LORA_MISO
++#undef LORA_MOSI
++#undef LORA_CS
++
++// battery charger BQ25896
++// #define HAS_PPM 1
++// #define XPOWERS_CHIP_BQ25896
++
++// battery quality management BQ27220
++#define HAS_BQ27220 1
++#define BQ27220_I2C_SDA I2C_SDA
++#define BQ27220_I2C_SCL I2C_SCL
++#define BQ27220_DESIGN_CAPACITY 250
++
++// WaveShare Core1262-868M OK
++// https://www.waveshare.com/wiki/Core1262-868M
++#define USE_SX1262
++
++#define LORA_MISO 22
++#define LORA_SCK 20
++#define LORA_MOSI 21
++#define LORA_CS 23
++#define LORA_RESET RADIOLIB_NC
++#define LORA_DIO1 15
++#define LORA_BUSY 19
++#define SX126X_CS LORA_CS
++#define SX126X_DIO1 LORA_DIO1
++#define SX126X_BUSY LORA_BUSY
++#define SX126X_RESET LORA_RESET
++#define SX126X_DIO2_AS_RF_SWITCH
++#define SX126X_DIO3_TCXO_VOLTAGE 3.0
++
++#define USE_TFTDISPLAY 1
++#define HAS_SPI_TFT 1
++#define ST7789_DRIVER
++#define ST7789_CS 17
++#define ST7789_RS 16
++#define ST7789_SDA 21
++#define ST7789_SCK 20
++#define ST7789_RESET -1
++#define ST7789_MISO 22
++#define ST7789_BUSY -1
++#define ST7789_SPI_HOST SPI2_HOST
++#define SPI_FREQUENCY 40000000
++#define SPI_READ_FREQUENCY 16000000
++#define TFT_HEIGHT 240
++#define TFT_WIDTH 135
++#define TFT_OFFSET_X -52
++#define TFT_OFFSET_Y 40
++#define TFT_OFFSET_ROTATION 2
++#define SCREEN_ROTATE
++#define SCREEN_TRANSITION_FRAMERATE 5
++#define BRIGHTNESS_DEFAULT 130
++#define TFT_MESH_OVERRIDE COLOR565(20, 240, 220)
++
++#ifndef HAS_TOUCHSCREEN
++#define HAS_TOUCHSCREEN 1
++#endif
++#define TOUCH_I2C_PORT 0
++#define TOUCH_SLAVE_ADDRESS 0x38
++#define SCREEN_TOUCH_INT 3
++#define TFT_BL_EXT (LCD_BACKLIGHT | IO_EXPANDER)
