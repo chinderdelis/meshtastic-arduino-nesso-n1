@@ -1,0 +1,126 @@
+diff --git a/src/Power.cpp b/src/Power.cpp
+index 14398692..5ce22c6c 100644
+--- a/src/Power.cpp
++++ b/src/Power.cpp
+@@ -1033,6 +1033,7 @@ void Power::reboot()
+     waypointStore.saveToFlash();
+ #endif
+ #if defined(ARCH_ESP32)
++    prepareBleForReboot();
+     ESP.restart();
+ #elif defined(ARCH_NRF52)
+     nrf52FlashQuiesce();
+diff --git a/src/main.h b/src/main.h
+index 9d7849c0..34a9cc99 100644
+--- a/src/main.h
++++ b/src/main.h
+@@ -117,6 +117,8 @@ void nrf52Setup(), esp32Setup(), nrf52Loop(), esp32Loop(), rp2040Setup(), rp2040
+     nrf52FlashQuiesce(), stm32wlSetup();
+ #ifdef ARCH_ESP32
+ void esp32ReleaseBluetoothMemoryIfUnused();
++// Graceful BLE disconnect before reboot; no-op on ESP32-S2 / BLE-less builds.
++void prepareBleForReboot();
+ #endif
+ 
+ meshtastic_DeviceMetadata getDeviceMetadata();
+diff --git a/src/nimble/NimbleBluetooth.cpp b/src/nimble/NimbleBluetooth.cpp
+index e01c32c7..753b806f 100644
+--- a/src/nimble/NimbleBluetooth.cpp
++++ b/src/nimble/NimbleBluetooth.cpp
+@@ -753,11 +753,18 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
+ 
+         const uint16_t connHandle = desc->conn_handle;
+ 
+-        // With Google Pixel 8 Android devices, this causes ESP32 device crash
+-        // when phone reconnects. Disable this to make progress on the
+-        // Arduino v3 migration while we investigate the Android compatibility
+-        // issue.
+-#if 0
++#if defined(CONFIG_IDF_TARGET_ESP32C6)
++        // Prefer 2M PHY and raise the link-layer data length (mirrors upstream master on C6/S3).
++        // The Pixel 8 reconnect crash that originally disabled the data length request dated back
++        // to the Arduino v3 migration stack; the current IDF 5.5.x NimBLE stack handles it.
++        int phyResult =
++            ble_gap_set_prefered_le_phy(connHandle, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_CODED_ANY);
++        if (phyResult == 0) {
++            LOG_INFO("BLE conn %u preferred 2M PHY", connHandle);
++        } else {
++            LOG_WARN("Failed to prefer 2M PHY for conn %u, rc=%d", connHandle, phyResult);
++        }
++
+         int dataLenResult = ble_gap_set_data_len(connHandle, kPreferredBleTxOctets, kPreferredBleTxTimeUs);
+         if (dataLenResult == 0) {
+             LOG_INFO("BLE conn %u requested data length %u bytes", connHandle, kPreferredBleTxOctets);
+@@ -1083,4 +1090,24 @@ void NimbleBluetooth::sendLog(const uint8_t *logMessage, size_t length)
+     logRadioCharacteristic->setValue(logMessage, length);
+     logRadioCharacteristic->notify();
+ }
++
++void NimbleBluetooth::prepareForReboot()
++{
++#ifdef ARCH_ESP32
++    // Graceful link teardown before ESP.restart(): the phone must see a real disconnect, otherwise
++    // it keeps a stale link until the supervision timeout and the post-reboot re-pairing often
++    // fails (mostly on Android).
++    isDeInit = true; // onDisconnect early-returns: no status churn, no advertising restart
++    pendingStartAdvertising = false;
++    bleDraining = true; // release any in-flight onRead wait immediately
++    if (bluetoothPhoneAPI)
++        bluetoothPhoneAPI->onReadCallbackIsWaitingForData = false;
++
++    uint16_t connHandle = nimbleBluetoothConnHandle.load();
++    if (connHandle != BLE_HS_CONN_HANDLE_NONE && bleServer) {
++        bleServer->disconnect(connHandle);
++        delay(250); // let the disconnect reach the phone before we reset
++    }
++#endif
++}
+ #endif
+diff --git a/src/nimble/NimbleBluetooth.h b/src/nimble/NimbleBluetooth.h
+index dad0a8c9..055d4ae1 100644
+--- a/src/nimble/NimbleBluetooth.h
++++ b/src/nimble/NimbleBluetooth.h
+@@ -13,6 +13,7 @@ class NimbleBluetooth : BluetoothApi
+     int getRssi();
+     void sendLog(const uint8_t *logMessage, size_t length);
+     void startAdvertising();
++    void prepareForReboot();
+     bool isDeInit = false;
+ 
+   private:
+diff --git a/src/platform/esp32/main-esp32.cpp b/src/platform/esp32/main-esp32.cpp
+index 1cc1a1c8..6fa14e7d 100644
+--- a/src/platform/esp32/main-esp32.cpp
++++ b/src/platform/esp32/main-esp32.cpp
+@@ -121,9 +121,16 @@ void setBluetoothEnable(bool enable)
+         // For deep-sleep, shutdown hardware with nimbleBluetooth->deinit(). Requires reboot to reverse
+     }
+ }
++
++void prepareBleForReboot()
++{
++    if (nimbleBluetooth)
++        nimbleBluetooth->prepareForReboot();
++}
+ #else
+ void setBluetoothEnable(bool enable) {}
+ void updateBatteryLevel(uint8_t level) {}
++void prepareBleForReboot() {}
+ #endif
+ 
+ void esp32ReleaseBluetoothMemoryIfUnused()
+diff --git a/variants/esp32c6/arduino_nesso_n1/platformio.ini b/variants/esp32c6/arduino_nesso_n1/platformio.ini
+index e512436d..3d677ed3 100644
+--- a/variants/esp32c6/arduino_nesso_n1/platformio.ini
++++ b/variants/esp32c6/arduino_nesso_n1/platformio.ini
+@@ -27,6 +27,10 @@ build_flags =
+   -D HAS_WIRE=1
+   -D SPI_3_WIRE=0
+   -D _ESP_LOGLEVEL_=5
++custom_sdkconfig =
++  ${esp32c6_base.custom_sdkconfig}
++  ; nessotasti0.2: allow the BLE controller to negotiate 2M PHY
++  CONFIG_BT_NIMBLE_LL_CFG_FEAT_LE_2M_PHY=y
+ monitor_speed=115200
+ lib_ignore =
+   libpax
